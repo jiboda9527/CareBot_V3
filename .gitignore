@@ -1,0 +1,15 @@
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.py[cod]
+
+# Runtime-generated data
+fall_events/
+*.log
+
+# Editor settings
+.vscode/
+
+# Local test and temporary artifacts
+test.wav
+.tools/
