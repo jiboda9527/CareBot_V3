@@ -32,6 +32,8 @@ flowchart LR
 - Raspberry Pi 5 with a supported camera and CareBot chassis/I2C hardware.
 - Python 3.11 (the project was tested with it).
 - `opencv-python`, `numpy`, and `onnxruntime`.
+- Optional: `mediapipe` enables pose-based near-distance protection. The robot
+  remains operational without it and uses bounding-box safety checks instead.
 - Robot hardware libraries used by `Track_SSD_Person_Follow.py`.
 - A display session, or use `--no-window` for SSH operation.
 
@@ -42,6 +44,12 @@ Python runtime packages:
 
 ```bash
 python3 -m pip install opencv-python numpy onnxruntime
+```
+
+For the optional pose-based near-distance check, install MediaPipe as well:
+
+```bash
+python3 -m pip install mediapipe
 ```
 
 The repository contains the supported model files in `models/`; no PyTorch or
@@ -80,6 +88,7 @@ CareBot_V3/
 ├── fall_detection.py           # Fall detection workflow
 ├── line_alert.py               # Line alert integration
 ├── ai_control.py               # AI-control helpers
+├── proximity_guard.py           # Near-distance person safety checks
 ├── models/
 │   ├── yolo26n.onnx            # Default YOLO26 Nano 320×320 model
 │   └── yolov8n.onnx            # Previous model retained for comparison
@@ -101,6 +110,27 @@ yolo export model=yolo26n.pt format=onnx imgsz=320 simplify=True
 ```
 
 Copy the resulting `yolo26n.onnx` into `models/` on the robot.
+
+## Near-distance protection
+
+While following a person, CareBot uses the detected person box to maintain a
+comfortable distance and to avoid driving toward a subject who is already too
+close. Distance commands use hysteresis, preventing jitter as the box size
+fluctuates around a threshold. The robot also waits for the pan servo to settle
+on the target before it resumes forward motion.
+
+`proximity_guard.py` adds a second protective check. A large person box clipped
+by the camera frame is treated as evidence that the person is too close. When
+MediaPipe is installed, visible Pose landmarks provide additional evidence for a
+partial body close to the camera. The condition must persist briefly before the
+robot commands a low-speed retreat, reducing false reactions to a single noisy
+frame. If MediaPipe is unavailable, only the bounding-box check is used.
+
+Validate this behavior with motors disabled before any hardware test:
+
+```bash
+python3 CareBot_Main.py --no-motor
+```
 
 ## Performance
 

@@ -27,6 +27,7 @@ if PARENT_DIR not in sys.path:
 import Track_SSD_Person_Follow as person_follow
 from fall_detection import FallDetector, PersonDetection
 from line_alert import send_fall_alert
+from proximity_guard import PersonProximityGuard
 
 
 class CareBotState(Enum):
@@ -52,18 +53,28 @@ TURN_ESCALATE_SECONDS = 2.5
 TURN_SLOW_SPEED = 2
 TURN_NORMAL_SPEED = 3
 TARGET_CONFIRM_FRAMES = 1
-FORWARD_CENTER_DEAD_ZONE = 70
+# The chassis must wait for the slower pan servo to settle before driving.
+FORWARD_CENTER_DEAD_ZONE = 35
 FORWARD_RESUME_PAN_MARGIN = 20
+FORWARD_CENTER_CONFIRM_SECONDS = 0.45
 
 AREA_TARGET = person_follow.area_center
-AREA_DEAD_BAND = 55000
-AREA_FAR_BAND = 100000
-FORWARD_SLOW_SPEED = 5
-FORWARD_NORMAL_SPEED = 8
-BACKWARD_SLOW_SPEED = -5
-BACKWARD_NORMAL_SPEED = -8
+# Hysteresis limits for distance control.  The robot stops inside the broad
+# middle band instead of reversing as soon as one delayed frame crosses the
+# target area.
+AREA_APPROACH_START = 110000
+AREA_APPROACH_STOP = 145000
+AREA_RETREAT_START = 245000
+AREA_RETREAT_STOP = 215000
+FORWARD_SLOW_SPEED = 3
+FORWARD_NORMAL_SPEED = 4
+BACKWARD_SLOW_SPEED = -3
+BACKWARD_NORMAL_SPEED = -4
 
 LOST_WAIT_SECONDS = 1.5
+# A detector can miss a person for one frame even while the person is still in
+# view.  Do not cancel a newly issued chassis command for such a brief miss.
+PERSON_LOSS_STOP_GRACE_SECONDS = 0.70
 LOST_SCAN_STEP = 2.0
 EMERGENCY_COOLDOWN_SECONDS = 6.0
 MAX_CONSECUTIVE_CAMERA_FAILURES = 5
@@ -86,6 +97,7 @@ class CareBotMain:
             model_path = yolo_model or os.path.join(CURRENT_DIR, "models", "yolo26n.onnx")
             self.detector = person_follow.YoloPersonDetector(
                 model_path,
+                confidence_threshold=0.30,
                 debug_inference=debug_inference,
             )
         else:
@@ -104,6 +116,7 @@ class CareBotMain:
         self.last_state_print_at = 0.0
         self.smooth_center_x = None
         self.smooth_area = None
+        self.distance_motion = 0
         self.pending_motion = (0, 0)
         self.pending_motion_count = 0
         self.active_motion = (0, 0)
@@ -117,6 +130,8 @@ class CareBotMain:
         self.chassis_turn_started_at = 0.0
         self.target_seen_frames = 0
         self.waiting_for_pan_center_after_turn = False
+        self.forward_centered_since = None
+        self.proximity_guard = PersonProximityGuard()
 
     def set_state(self, state):
         if self.state != state:
@@ -139,6 +154,7 @@ class CareBotMain:
         self.pending_motion_count = 0
         self.reset_chassis_turn_state()
         self.waiting_for_pan_center_after_turn = False
+        self.forward_centered_since = None
 
     def reset_fall_detection(self):
         person_follow.fall_frame_count = 0
@@ -147,6 +163,7 @@ class CareBotMain:
     def reset_tracking_smoothing(self):
         self.smooth_center_x = None
         self.smooth_area = None
+        self.distance_motion = 0
 
     def reset_chassis_turn_state(self):
         self.pan_limit_since = None
@@ -171,18 +188,22 @@ class CareBotMain:
         return int(self.smooth_center_x), int(self.smooth_area)
 
     def choose_forward_speed(self, bbox_area):
-        area_error = AREA_TARGET - bbox_area
-        if abs(area_error) <= AREA_DEAD_BAND:
-            return 0
+        """Return a stable distance command using area hysteresis."""
+        if self.distance_motion > 0:
+            if bbox_area >= AREA_APPROACH_STOP:
+                self.distance_motion = 0
+        elif self.distance_motion < 0:
+            if bbox_area <= AREA_RETREAT_STOP:
+                self.distance_motion = 0
+        elif bbox_area <= AREA_APPROACH_START:
+            self.distance_motion = FORWARD_NORMAL_SPEED
+        elif bbox_area >= AREA_RETREAT_START:
+            self.distance_motion = BACKWARD_SLOW_SPEED
 
-        if area_error > 0:
-            if area_error >= AREA_FAR_BAND:
-                return FORWARD_NORMAL_SPEED
+        # Slow down before the stop threshold, while still approaching.
+        if self.distance_motion > 0 and bbox_area >= AREA_APPROACH_START - 30000:
             return FORWARD_SLOW_SPEED
-
-        if abs(area_error) >= AREA_FAR_BAND:
-            return BACKWARD_NORMAL_SPEED
-        return BACKWARD_SLOW_SPEED
+        return self.distance_motion
 
     def update_chassis_turn_gate(
         self,
@@ -253,13 +274,20 @@ class CareBotMain:
         return False
 
     def allow_forward_motion(self, pan_error):
-        pan_center_error = abs(self.pan_angle - person_follow.PAN_CENTER)
-        return (
+        centered = (
             self.target_seen_frames >= TARGET_CONFIRM_FRAMES
             and abs(pan_error) <= FORWARD_CENTER_DEAD_ZONE
-            and pan_center_error <= FORWARD_RESUME_PAN_MARGIN
             and self.allow_forward_motion_after_turn()
         )
+        if not centered:
+            self.forward_centered_since = None
+            return False
+
+        now = time.monotonic()
+        if self.forward_centered_since is None:
+            self.forward_centered_since = now
+            return False
+        return now - self.forward_centered_since >= FORWARD_CENTER_CONFIRM_SECONDS
 
     def command_chassis(self, speed_value, turn_value):
         if turn_value != 0:
@@ -310,18 +338,21 @@ class CareBotMain:
         return self.active_motion
 
     def handle_lost_person(self):
+        now = time.monotonic()
+        if self.lost_person_since is None:
+            self.lost_person_since = now
+            return False
+
+        if now - self.lost_person_since < PERSON_LOSS_STOP_GRACE_SECONDS:
+            return False
+
         self.stop_robot()
         self.reset_fall_detection()
         self.reset_tracking_smoothing()
         self.target_seen_frames = 0
 
-        now = time.monotonic()
-        if self.lost_person_since is None:
-            self.lost_person_since = now
-            return
-
         if now - self.lost_person_since < LOST_WAIT_SECONDS:
-            return
+            return True
 
         self.pan_angle += self.lost_scan_direction * LOST_SCAN_STEP
         if self.pan_angle >= person_follow.PAN_MAX:
@@ -333,9 +364,11 @@ class CareBotMain:
 
         if not self.no_motor:
             person_follow.Facebot.Ctrl_Servo(1, int(round(self.pan_angle)))
+        return True
 
     def follow_target(self, frame, bbox, center_x, image_width, image_height):
         x, y, w, h = bbox
+        proximity = self.proximity_guard.update(frame, bbox)
         raw_area = person_follow.limit_max_vlaue(w * h, 2000, 350000)
         smooth_center_x, smooth_area = self.smooth_target(center_x, raw_area)
         person_center_y = y + h // 2
@@ -391,12 +424,19 @@ class CareBotMain:
             turn_value = 0
             person_follow.reset_pid(person_follow.direction_pid)
 
-        forward_allowed = turn_value == 0 and self.allow_forward_motion(pan_error)
-        speed_value = (
-            self.choose_forward_speed(smooth_area)
-            if forward_allowed
-            else 0
-        )
+        if proximity.too_close:
+            # A partial person or a box extending beyond the view must never
+            # be treated as a normal target merely because its area is small.
+            turn_value = 0
+            speed_value = BACKWARD_SLOW_SPEED
+            self.distance_motion = 0
+        else:
+            forward_allowed = turn_value == 0 and self.allow_forward_motion(pan_error)
+            speed_value = (
+                self.choose_forward_speed(smooth_area)
+                if forward_allowed
+                else 0
+            )
         active_speed, active_turn = self.command_chassis(speed_value, turn_value)
 
         cv2.circle(frame, (target_x, image_height // 2), 10, (0, 0, 255), -1)
@@ -414,6 +454,29 @@ class CareBotMain:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (0, 255, 0),
+            2,
+        )
+        proximity_text = (
+            f"TOO CLOSE: {proximity.reason}"
+            if proximity.too_close
+            else f"body h{proximity.head_points} t{proximity.torso_points} e{proximity.extremity_points}"
+        )
+        cv2.putText(
+            frame,
+            proximity_text,
+            (20, 104),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 255) if proximity.too_close else (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            frame,
+            f"motor v={active_speed} turn={active_turn}",
+            (20, 132),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
             2,
         )
         # Per-frame console I/O is costly on a Raspberry Pi and adds lag.
@@ -495,8 +558,8 @@ class CareBotMain:
                 inference_ms = getattr(self.detector, "last_inference_ms", 0.0)
 
                 if not bboxs:
-                    self.handle_lost_person()
-                    self.set_state(CareBotState.SEARCH_PERSON)
+                    if self.handle_lost_person():
+                        self.set_state(CareBotState.SEARCH_PERSON)
                 else:
                     self.lost_person_since = None
                     self.target_seen_frames += 1
@@ -569,6 +632,7 @@ class CareBotMain:
             print("\nCareBot stopped by user.")
         finally:
             self.stop_robot()
+            self.proximity_guard.close()
             if not self.no_motor:
                 person_follow.Facebot.Ctrl_Servo(1, 90)
                 person_follow.Facebot.Ctrl_Servo(2, 25)
