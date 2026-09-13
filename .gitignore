@@ -13,3 +13,5 @@ fall_events/
 # Local test and temporary artifacts
 test.wav
 .tools/
+.env
+
