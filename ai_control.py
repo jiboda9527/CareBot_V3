@@ -2,6 +2,25 @@ import requests
 import socket
 import time
 import json
+import os
+from pathlib import Path
+
+CURRENT_DIR = Path(__file__).resolve().parent
+ENV_FILE = CURRENT_DIR / ".env"
+
+if ENV_FILE.exists():
+    with ENV_FILE.open("r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 def force_ipv4():
     original_getaddrinfo = socket.getaddrinfo
@@ -20,7 +39,10 @@ def force_ipv4():
 
 force_ipv4()
 
-API_KEY = "sk-fc7032b984304bfb9a45a6c2e68010c1"
+API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+
+if not API_KEY:
+    raise RuntimeError("DEEPSEEK_API_KEY is not set")
 
 URL = "https://api.deepseek.com/v1/chat/completions"
 
