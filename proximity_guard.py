@@ -19,11 +19,17 @@ except ImportError:  # Keep normal YOLO following available if Pose is absent.
 POSE_VISIBILITY_THRESHOLD = 0.50
 EDGE_MARGIN_RATIO = 0.035
 OVERCLOSE_CONFIRM_FRAMES = 2
+CLEAR_CONFIRM_FRAMES = 5
+# Pose inference is only useful for an already suspiciously large or clipped
+# detection.  Running it less often keeps the follow-control feedback timely.
+POSE_CHECK_INTERVAL_FRAMES = 3
+POSE_SUSPECT_AREA_RATIO = 0.25
 
 
 @dataclass
 class ProximityResult:
     too_close: bool = False
+    clear_confirmed: bool = False
     reason: str = "normal"
     edge_contacts: int = 0
     head_points: int = 0
@@ -43,6 +49,9 @@ class PersonProximityGuard:
     def __init__(self, enabled=True):
         self.pose = None
         self.overclose_frames = 0
+        self.clear_frames = 0
+        self.frame_count = 0
+        self.last_pose_groups = (0, 0, 0)
         self.available = bool(enabled and mp is not None)
         if self.available:
             try:
@@ -120,9 +129,19 @@ class PersonProximityGuard:
             and (area_ratio >= 0.48 or width_ratio >= 0.82 or height_ratio >= 0.90)
         )
 
-        head_points, torso_points, extremity_points = self._visible_pose_groups(frame)
+        self.frame_count += 1
+        pose_suspect = edge_contacts >= 1 or area_ratio >= POSE_SUSPECT_AREA_RATIO
+        if pose_suspect and self.frame_count % POSE_CHECK_INTERVAL_FRAMES == 0:
+            self.last_pose_groups = self._visible_pose_groups(frame)
+        elif not pose_suspect:
+            self.last_pose_groups = (0, 0, 0)
+
+        head_points, torso_points, extremity_points = self.last_pose_groups
         pose_too_close = (
-            extremity_points >= 1 and head_points == 0 and torso_points < 2
+            pose_suspect
+            and extremity_points >= 1
+            and head_points == 0
+            and torso_points < 2
         )
 
         if bbox_too_close:
@@ -145,9 +164,12 @@ class PersonProximityGuard:
         result = self.evaluate(frame, bbox)
         if result.too_close:
             self.overclose_frames += 1
+            self.clear_frames = 0
         else:
             self.overclose_frames = 0
+            self.clear_frames += 1
         result.too_close = self.overclose_frames >= OVERCLOSE_CONFIRM_FRAMES
+        result.clear_confirmed = self.clear_frames >= CLEAR_CONFIRM_FRAMES
         return result
 
     def close(self):

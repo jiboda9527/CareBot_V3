@@ -113,18 +113,26 @@ Copy the resulting `yolo26n.onnx` into `models/` on the robot.
 
 ## Near-distance protection
 
-While following a person, CareBot uses the detected person box to maintain a
-comfortable distance and to avoid driving toward a subject who is already too
-close. Distance commands use hysteresis, preventing jitter as the box size
-fluctuates around a threshold. The robot also waits for the pan servo to settle
-on the target before it resumes forward motion.
+While following a person, CareBot uses three exclusive phases: it first stops
+the chassis and centers the person with the pan camera, then locks that pan
+bearing and slowly rotates the chassis to match it, and only then enables
+forward/backward distance following. The alignment phase does not allow image
+error to reverse the chassis: a large image deviation stops the chassis and
+returns control to the camera-centering phase. This prevents the camera and
+chassis from chasing each other and producing a left/right oscillation.
+Distance commands use hysteresis, preventing jitter as the box size fluctuates
+around a threshold. The robot also waits for the pan servo to settle on the
+target before it resumes forward motion.
 
 `proximity_guard.py` adds a second protective check. A large person box clipped
 by the camera frame is treated as evidence that the person is too close. When
 MediaPipe is installed, visible Pose landmarks provide additional evidence for a
 partial body close to the camera. The condition must persist briefly before the
-robot commands a low-speed retreat, reducing false reactions to a single noisy
-frame. If MediaPipe is unavailable, only the bounding-box check is used.
+robot makes one short low-speed retreat; it then stays stopped until the view
+has been clear for several frames. This avoids endless forward/backward
+oscillation. Pose inference runs only for a suspiciously large or clipped box
+and at a reduced rate, so normal tracking keeps low latency. If MediaPipe is
+unavailable, only the bounding-box check is used.
 
 Validate this behavior with motors disabled before any hardware test:
 

@@ -38,6 +38,12 @@ class CareBotState(Enum):
     EMERGENCY = "EMERGENCY"
 
 
+class FollowPhase(Enum):
+    ACQUIRE_AND_CENTER = "ACQUIRE_AND_CENTER"
+    ALIGN_BASE = "ALIGN_BASE"
+    FOLLOW_DISTANCE = "FOLLOW_DISTANCE"
+
+
 # More responsive tracking.  The previous conservative values accumulated
 # noticeable delay before the chassis was allowed to react.
 SMOOTH_ALPHA = 0.55
@@ -45,18 +51,20 @@ CHASSIS_UPDATE_INTERVAL = 0.12
 MOVE_CONFIRM_FRAMES = 1
 STOP_CONFIRM_FRAMES = 1
 
-TURN_CENTER_DEAD_ZONE = 110
-TURN_RELEASE_DEAD_ZONE = 60
-TURN_FORCE_DEAD_ZONE = 190
-TURN_LIMIT_HOLD_SECONDS = 0.25
-TURN_ESCALATE_SECONDS = 2.5
-TURN_SLOW_SPEED = 2
-TURN_NORMAL_SPEED = 3
-TARGET_CONFIRM_FRAMES = 1
-# The chassis must wait for the slower pan servo to settle before driving.
-FORWARD_CENTER_DEAD_ZONE = 35
-FORWARD_RESUME_PAN_MARGIN = 20
-FORWARD_CENTER_CONFIRM_SECONDS = 0.45
+# Follow phases: center the camera first, then align the chassis, then move.
+ACQUIRE_CENTER_DEAD_ZONE = 35
+ACQUIRE_PAN_STABLE_DELTA = 0.8
+ACQUIRE_STABLE_FRAMES = 5
+ALIGN_CENTER_DEAD_ZONE = 35
+ALIGN_ABORT_CENTER_ERROR = 100
+ALIGN_PAN_GAIN = 0.006
+ALIGN_PAN_MAX_STEP = 0.45
+ALIGN_PAN_CENTER_MARGIN = 6.0
+ALIGN_COMPLETE_FRAMES = 4
+ALIGN_SLOW_ANGLE = 14.0
+ALIGN_SLOW_TURN_SPEED = 1
+ALIGN_TURN_SPEED = 2
+FOLLOW_REACQUIRE_CENTER_ERROR = 90
 
 AREA_TARGET = person_follow.area_center
 # Hysteresis limits for distance control.  The robot stops inside the broad
@@ -70,6 +78,10 @@ FORWARD_SLOW_SPEED = 3
 FORWARD_NORMAL_SPEED = 4
 BACKWARD_SLOW_SPEED = -3
 BACKWARD_NORMAL_SPEED = -4
+
+# A near-distance event gets one bounded retreat, then the robot stays stopped
+# until the scene has been clear for several frames.  It must not oscillate.
+PROXIMITY_RETREAT_SECONDS = 0.55
 
 LOST_WAIT_SECONDS = 1.5
 # A detector can miss a person for one frame even while the person is still in
@@ -124,13 +136,13 @@ class CareBotMain:
         self.lost_person_since = None
         self.lost_scan_direction = 1
         self.emergency_cooldown_until = 0.0
-        self.pan_limit_since = None
-        self.pan_limit_direction = 0
-        self.chassis_turning = False
-        self.chassis_turn_started_at = 0.0
-        self.target_seen_frames = 0
-        self.waiting_for_pan_center_after_turn = False
-        self.forward_centered_since = None
+        self.follow_phase = FollowPhase.ACQUIRE_AND_CENTER
+        self.locked_pan_offset = None
+        self.acquire_stable_frames = 0
+        self.alignment_stable_frames = 0
+        self.last_acquire_pan_angle = self.pan_angle
+        self.proximity_hold = False
+        self.proximity_retreat_until = None
         self.proximity_guard = PersonProximityGuard()
 
     def set_state(self, state):
@@ -152,9 +164,8 @@ class CareBotMain:
         self.active_motion = (0, 0)
         self.pending_motion = (0, 0)
         self.pending_motion_count = 0
-        self.reset_chassis_turn_state()
-        self.waiting_for_pan_center_after_turn = False
-        self.forward_centered_since = None
+        self.proximity_hold = False
+        self.proximity_retreat_until = None
 
     def reset_fall_detection(self):
         person_follow.fall_frame_count = 0
@@ -165,11 +176,21 @@ class CareBotMain:
         self.smooth_area = None
         self.distance_motion = 0
 
-    def reset_chassis_turn_state(self):
-        self.pan_limit_since = None
-        self.pan_limit_direction = 0
-        self.chassis_turning = False
-        self.chassis_turn_started_at = 0.0
+    def set_follow_phase(self, phase):
+        if self.follow_phase != phase:
+            print(f"[FOLLOW] {self.follow_phase.value} -> {phase.value}")
+            self.follow_phase = phase
+
+        if phase == FollowPhase.ACQUIRE_AND_CENTER:
+            self.locked_pan_offset = None
+            self.acquire_stable_frames = 0
+            self.alignment_stable_frames = 0
+            self.last_acquire_pan_angle = self.pan_angle
+        elif phase == FollowPhase.ALIGN_BASE:
+            self.alignment_stable_frames = 0
+
+    def reset_follow_phase(self):
+        self.set_follow_phase(FollowPhase.ACQUIRE_AND_CENTER)
 
     def smooth_target(self, center_x, area):
         if self.smooth_center_x is None:
@@ -205,89 +226,32 @@ class CareBotMain:
             return FORWARD_SLOW_SPEED
         return self.distance_motion
 
-    def update_chassis_turn_gate(
-        self,
-        pan_error,
-        pan_near_left_edge,
-        pan_near_right_edge,
-    ):
-        if self.target_seen_frames < TARGET_CONFIRM_FRAMES:
-            self.reset_chassis_turn_state()
-            return False
+    def move_pan_toward_target(self, pan_error, gain, max_step):
+        """Move the pan servo by a bounded correction and return its change."""
+        if abs(pan_error) <= person_follow.PAN_DEAD_ZONE:
+            return 0.0
 
-        if abs(pan_error) < TURN_RELEASE_DEAD_ZONE:
-            self.reset_chassis_turn_state()
-            return False
-
-        if pan_error > TURN_CENTER_DEAD_ZONE and pan_near_left_edge:
-            needed_direction = 1
-        elif pan_error < -TURN_CENTER_DEAD_ZONE and pan_near_right_edge:
-            needed_direction = -1
-        else:
-            self.reset_chassis_turn_state()
-            return False
-
-        now = time.monotonic()
-        if needed_direction != self.pan_limit_direction:
-            self.pan_limit_direction = needed_direction
-            self.pan_limit_since = now
-            self.chassis_turning = False
-            self.chassis_turn_started_at = 0.0
-            return False
-
-        if self.pan_limit_since is None:
-            self.pan_limit_since = now
-            return False
-
-        if not self.chassis_turning:
-            if now - self.pan_limit_since < TURN_LIMIT_HOLD_SECONDS:
-                return False
-            self.chassis_turning = True
-            self.chassis_turn_started_at = now
-
-        return True
-
-    def choose_turn_value(self, pan_error):
-        if abs(pan_error) < TURN_CENTER_DEAD_ZONE:
-            return 0
-
-        turn_elapsed = time.monotonic() - self.chassis_turn_started_at
-        turn_speed = (
-            TURN_NORMAL_SPEED
-            if (
-                turn_elapsed >= TURN_ESCALATE_SECONDS
-                and abs(pan_error) >= TURN_FORCE_DEAD_ZONE
-            )
-            else TURN_SLOW_SPEED
+        pan_step = person_follow.clamp(pan_error * gain, -max_step, max_step)
+        previous_angle = self.pan_angle
+        self.pan_angle = person_follow.clamp(
+            self.pan_angle - pan_step,
+            person_follow.PAN_MIN,
+            person_follow.PAN_MAX,
         )
-        return turn_speed if pan_error > 0 else -turn_speed
+        if not self.no_motor:
+            person_follow.Facebot.Ctrl_Servo(1, int(round(self.pan_angle)))
+        return self.pan_angle - previous_angle
 
-    def allow_forward_motion_after_turn(self):
-        if not self.waiting_for_pan_center_after_turn:
-            return True
-
-        pan_center_error = abs(self.pan_angle - person_follow.PAN_CENTER)
-        if pan_center_error <= FORWARD_RESUME_PAN_MARGIN:
-            self.waiting_for_pan_center_after_turn = False
-            return True
-
-        return False
-
-    def allow_forward_motion(self, pan_error):
-        centered = (
-            self.target_seen_frames >= TARGET_CONFIRM_FRAMES
-            and abs(pan_error) <= FORWARD_CENTER_DEAD_ZONE
-            and self.allow_forward_motion_after_turn()
+    def choose_alignment_turn(self):
+        """Turn only toward the bearing captured after camera centering."""
+        remaining_offset = person_follow.PAN_CENTER - self.pan_angle
+        direction = 1 if self.locked_pan_offset > 0 else -1
+        speed = (
+            ALIGN_SLOW_TURN_SPEED
+            if abs(remaining_offset) < ALIGN_SLOW_ANGLE
+            else ALIGN_TURN_SPEED
         )
-        if not centered:
-            self.forward_centered_since = None
-            return False
-
-        now = time.monotonic()
-        if self.forward_centered_since is None:
-            self.forward_centered_since = now
-            return False
-        return now - self.forward_centered_since >= FORWARD_CENTER_CONFIRM_SECONDS
+        return direction * speed, remaining_offset
 
     def command_chassis(self, speed_value, turn_value):
         if turn_value != 0:
@@ -349,7 +313,7 @@ class CareBotMain:
         self.stop_robot()
         self.reset_fall_detection()
         self.reset_tracking_smoothing()
-        self.target_seen_frames = 0
+        self.reset_follow_phase()
 
         if now - self.lost_person_since < LOST_WAIT_SECONDS:
             return True
@@ -376,20 +340,6 @@ class CareBotMain:
         pan_error = smooth_center_x - target_x
         tilt_error = person_center_y - image_height // 2
 
-        if abs(pan_error) > person_follow.PAN_DEAD_ZONE:
-            pan_step = person_follow.clamp(
-                pan_error * person_follow.PAN_GAIN,
-                -person_follow.PAN_MAX_STEP,
-                person_follow.PAN_MAX_STEP,
-            )
-            self.pan_angle = person_follow.clamp(
-                self.pan_angle - pan_step,
-                person_follow.PAN_MIN,
-                person_follow.PAN_MAX,
-            )
-            if not self.no_motor:
-                person_follow.Facebot.Ctrl_Servo(1, int(round(self.pan_angle)))
-
         if abs(tilt_error) > person_follow.TILT_DEAD_ZONE:
             tilt_step = person_follow.clamp(
                 tilt_error * person_follow.TILT_GAIN,
@@ -404,40 +354,102 @@ class CareBotMain:
             if not self.no_motor:
                 person_follow.Facebot.Ctrl_Servo(2, int(round(self.tilt_angle)))
 
-        pan_near_left_edge = (
-            self.pan_angle <= person_follow.PAN_MIN + person_follow.PAN_CHASSIS_MARGIN
-        )
-        pan_near_right_edge = (
-            self.pan_angle >= person_follow.PAN_MAX - person_follow.PAN_CHASSIS_MARGIN
-        )
-        chassis_turn_allowed = self.update_chassis_turn_gate(
-            pan_error,
-            pan_near_left_edge,
-            pan_near_right_edge,
-        )
+        now = time.monotonic()
+        if self.proximity_hold and proximity.clear_confirmed:
+            self.proximity_hold = False
+            self.proximity_retreat_until = None
 
-        if chassis_turn_allowed:
-            turn_value = self.choose_turn_value(pan_error)
-            if turn_value != 0:
-                self.waiting_for_pan_center_after_turn = True
-        else:
-            turn_value = 0
-            person_follow.reset_pid(person_follow.direction_pid)
+        if not self.proximity_hold and proximity.too_close:
+            # Retreat exactly once, then stop and require a clear view.  This
+            # prevents a noisy close-range classification from reversing forever.
+            self.proximity_hold = True
+            self.proximity_retreat_until = now + PROXIMITY_RETREAT_SECONDS
+            self.reset_follow_phase()
 
-        if proximity.too_close:
-            # A partial person or a box extending beyond the view must never
-            # be treated as a normal target merely because its area is small.
-            turn_value = 0
-            speed_value = BACKWARD_SLOW_SPEED
+        if self.proximity_hold:
             self.distance_motion = 0
-        else:
-            forward_allowed = turn_value == 0 and self.allow_forward_motion(pan_error)
             speed_value = (
-                self.choose_forward_speed(smooth_area)
-                if forward_allowed
+                BACKWARD_SLOW_SPEED
+                if now < self.proximity_retreat_until
                 else 0
             )
-        active_speed, active_turn = self.command_chassis(speed_value, turn_value)
+            active_speed, active_turn = self.command_chassis(speed_value, 0)
+            turn_state = "NEAR_HOLD"
+        elif self.follow_phase == FollowPhase.ACQUIRE_AND_CENTER:
+            # Phase 1: the chassis is stopped; only the camera acquires and
+            # stabilizes the target in the image center.
+            self.move_pan_toward_target(
+                pan_error,
+                person_follow.PAN_GAIN,
+                person_follow.PAN_MAX_STEP,
+            )
+            image_centered = abs(pan_error) <= ACQUIRE_CENTER_DEAD_ZONE
+            pan_stable = (
+                abs(self.pan_angle - self.last_acquire_pan_angle)
+                <= ACQUIRE_PAN_STABLE_DELTA
+            )
+            if image_centered and pan_stable:
+                self.acquire_stable_frames += 1
+            else:
+                self.acquire_stable_frames = 0
+            self.last_acquire_pan_angle = self.pan_angle
+
+            active_speed, active_turn = self.command_chassis(0, 0)
+            if self.acquire_stable_frames >= ACQUIRE_STABLE_FRAMES:
+                # Positive means a target to the right, matching the existing
+                # motor turn sign used by control_motor_speed().
+                self.locked_pan_offset = person_follow.PAN_CENTER - self.pan_angle
+                if abs(self.locked_pan_offset) <= ALIGN_PAN_CENTER_MARGIN:
+                    self.set_follow_phase(FollowPhase.FOLLOW_DISTANCE)
+                else:
+                    self.set_follow_phase(FollowPhase.ALIGN_BASE)
+            turn_state = "CENTERING"
+        elif self.follow_phase == FollowPhase.ALIGN_BASE:
+            # Phase 2: never drive forward/backward.  The initial pan bearing
+            # selects a fixed chassis direction; image error cannot reverse it.
+            if abs(pan_error) > ALIGN_ABORT_CENTER_ERROR:
+                self.reset_follow_phase()
+                active_speed, active_turn = self.command_chassis(0, 0)
+                turn_state = "REACQUIRE"
+            else:
+                self.move_pan_toward_target(
+                    pan_error,
+                    ALIGN_PAN_GAIN,
+                    ALIGN_PAN_MAX_STEP,
+                )
+                remaining_offset = person_follow.PAN_CENTER - self.pan_angle
+                alignment_ready = (
+                    abs(pan_error) <= ALIGN_CENTER_DEAD_ZONE
+                    and abs(remaining_offset) <= ALIGN_PAN_CENTER_MARGIN
+                )
+                if alignment_ready:
+                    active_speed, active_turn = self.command_chassis(0, 0)
+                    if (active_speed, active_turn) == (0, 0):
+                        self.alignment_stable_frames += 1
+                    if self.alignment_stable_frames >= ALIGN_COMPLETE_FRAMES:
+                        self.set_follow_phase(FollowPhase.FOLLOW_DISTANCE)
+                    turn_state = "SETTLING"
+                else:
+                    self.alignment_stable_frames = 0
+                    turn_value, remaining_offset = self.choose_alignment_turn()
+                    active_speed, active_turn = self.command_chassis(0, turn_value)
+                    turn_state = "ALIGNING"
+        else:
+            # Phase 3: distance-only control.  A large horizontal error stops
+            # the chassis and sends control back through camera acquisition.
+            if abs(pan_error) > FOLLOW_REACQUIRE_CENTER_ERROR:
+                self.reset_follow_phase()
+                active_speed, active_turn = self.command_chassis(0, 0)
+                turn_state = "REACQUIRE"
+            else:
+                self.move_pan_toward_target(
+                    pan_error,
+                    person_follow.PAN_GAIN,
+                    person_follow.PAN_MAX_STEP,
+                )
+                speed_value = self.choose_forward_speed(smooth_area)
+                active_speed, active_turn = self.command_chassis(speed_value, 0)
+                turn_state = "DISTANCE"
 
         cv2.circle(frame, (target_x, image_height // 2), 10, (0, 0, 255), -1)
         cv2.line(
@@ -449,17 +461,24 @@ class CareBotMain:
         )
         cv2.putText(
             frame,
-            f"state={self.state.value}",
+            (
+                f"phase={self.follow_phase.value} x={center_x} "
+                f"imgErr={pan_error:+d} pan={self.pan_angle:.1f}"
+            ),
             (20, 76),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.55,
             (0, 255, 0),
             2,
         )
         proximity_text = (
-            f"TOO CLOSE: {proximity.reason}"
-            if proximity.too_close
-            else f"body h{proximity.head_points} t{proximity.torso_points} e{proximity.extremity_points}"
+            "TOO CLOSE: RETREAT"
+            if self.proximity_hold and now < self.proximity_retreat_until
+            else (
+                "TOO CLOSE: HOLD"
+                if self.proximity_hold
+                else f"body h{proximity.head_points} t{proximity.torso_points} e{proximity.extremity_points}"
+            )
         )
         cv2.putText(
             frame,
@@ -472,8 +491,23 @@ class CareBotMain:
         )
         cv2.putText(
             frame,
-            f"motor v={active_speed} turn={active_turn}",
+            (
+                f"lockedPan={self.locked_pan_offset} state={turn_state} "
+                f"motor v={active_speed} turn={active_turn}"
+            ),
             (20, 132),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            (
+                f"area={smooth_area} phase={self.follow_phase.value} "
+                f"near={proximity.reason}"
+            ),
+            (20, 160),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             (0, 255, 255),
@@ -562,7 +596,6 @@ class CareBotMain:
                         self.set_state(CareBotState.SEARCH_PERSON)
                 else:
                     self.lost_person_since = None
-                    self.target_seen_frames += 1
 
                     if time.monotonic() < self.emergency_cooldown_until:
                         self.stop_robot()
